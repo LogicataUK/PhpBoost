@@ -14,7 +14,7 @@ Copy and paste the following commands in your terminal:
 
 ```bash
 mkdir -p /opt/logicata/phpboost && \
-  curl "https://raw.githubusercontent.com/LogicataUK/blog-supporting-tools/master/src/2022/aws-best-practices-for-php/phpboost" -s -o /opt/logicata/phpboost/phpboost && \
+  curl "https://raw.githubusercontent.com/LogicataUK/PhpBoost/master/src/phpboost" -s -o /opt/logicata/phpboost/phpboost && \
   chmod +x /opt/logicata/phpboost/phpboost && \
   ln -s /opt/logicata/phpboost/phpboost /usr/bin/phpboost
 ```
