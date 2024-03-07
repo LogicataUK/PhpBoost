@@ -1,0 +1,738 @@
+#!/usr/bin/env bash
+
+#
+#           &&&&&&
+#          &&&&&&&&
+#          %&&&&*     &&&&&&&
+#       &&&& &&&&&&&& &&&&&&&&
+#  &&&&&&&&& &&&&&&&&&  &&&&  &&&&&&&&&&         &&&                             &&&                       &
+#  #&&&&&&&&&, &&&&   %&&&&&&&&& &&&&&&&&        &&&         &&&&      .&&& &&&  &&&     &&&&   /&&&&   &&&&&&#  #&&&&
+#    &&&     &&&&&&&&&&& &&&&&&&& &&&&&&         &&&      &&&   &&&% &&&&  &&&&  &&&  &&&           &&&   &&    *    &&&
+#              &&&&&&&&&& &&&&&&% &&             &&&      &&&    &&& &&&    &&&  &&&  &&&      &&&  &&&   &&    &&&  &&&
+#               &&&&&&&& &&& &&&&&&&             &&&&&&&&  &&&&&&&&   &&&&&&&&&  &&&   &&&&&& /&&&&&&&&   &&&&#(&&&&&&&&
+#                    &&&&&& &&&&&&&&&                                      &&&
+#                 &&&&&&&&&, &&&&&&&&                                 &&&&&&
+#                 &&&&&&&&&&  &&&&&
+#                  &&&&&&&&
+#
+#                                      © 2022-2024 Logicata Ltd - https://www.logicata.com
+#
+#
+#  Author: Adriano Cataluddi <adriano.cataluddi _at_ logicata.com>
+#
+#  LICENCE
+#  =======
+#
+#  © 2022-2024 Logicata Ltd - https://www.logicata.com
+#
+#  Permission is hereby granted, free of charge, to any person obtaining a copy
+#  of this software and associated documentation files (the "Software"), to deal
+#  in the Software without restriction, including without limitation the rights
+#  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+#  copies of the Software, and to permit persons to whom the Software is
+#  furnished to do so, subject to the following conditions:
+#
+#  The above copyright notice and this permission notice shall be included in all
+#  copies or substantial portions of the Software.
+#
+#  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+#  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+#  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+#  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+#  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+#  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+#  SOFTWARE.
+#
+
+
+
+# CONSTANTS
+# ======================================================================================================================
+APP_VERSION=0.1.0
+APP_NAME=PhpBoost
+APP_BINARY_NAME=phpboost
+UI_VIEW_HEIGHT=22
+LOGICATA_WEBSITE=https://www.logicata.com
+ARTICLE_URL="${LOGICATA_WEBSITE}/blog/aws-best-practices-for-php"
+HUB_URL="${LOGICATA_WEBSITE}/follow"
+DEFAULT_DURATION=2
+DATA_FILE=/tmp/php-memory.csv
+PHP_FPM_CONFIG_FILENAME=logicata-php-fmp.conf
+SAMPLING_RES=10
+
+
+
+# FUNCTIONS
+# ======================================================================================================================
+
+#
+# Returns the amount of consumed memory (in KB) by PHP-FPM
+#
+function get_php_total_memory_usage {
+
+  ensure_php_is_running
+  get_process_total_memory_usage "php-fpm"
+}
+
+
+#
+# Returns the breakdown of memory consumed by the PHP-FPM processes (in KB).
+#
+function get_php_memory_usage_breakdown {
+
+  ensure_php_is_running
+  get_process_memory_usage_breakdown "php-fpm"
+}
+
+
+#
+# Returns the amount of consumed memory (in KB) by the given process
+#
+#   pattern The process name substring
+#
+function get_process_total_memory_usage {
+
+  local pattern=${1}
+  local total=0
+
+  # shellcheck disable=SC2207
+  local ram_usages=($(get_process_memory_usage_breakdown "${pattern}"))
+
+  for (( i = 0; i < ${#ram_usages[@]}; i++))
+  do
+    total=$((total+${ram_usages[$i]}))
+  done
+
+  echo "${total}"
+}
+
+
+#
+# Returns the breakdown of memory consumed by the given process sub-processes (in KB).
+#
+#   pattern The process name substring
+#
+function get_process_memory_usage_breakdown {
+
+  local pattern=${1}
+  local partials=""
+  local i
+
+  readarray -t list < <(ps -lC "${pattern}")
+
+  for (( i = 1; i < ${#list[@]}; i++))
+  do
+    pid=$(echo "${list[$i]}" | awk '{ print $4 }')
+    partials="${partials} $(grep Pss "/proc/$pid/smaps" | awk '{ram+=$2} END { printf "%d\n", ram}')"
+  done
+  echo "${partials}"
+}
+
+
+#
+# Counts the PHP-FPM processes
+#
+function count_php_processes {
+
+  ensure_php_is_running
+  ps -lyC php-fpm | tail -n +2 | wc -l
+}
+
+
+#
+# Returns the amount of free memory
+#
+function get_free_memory {
+
+  free -k | grep -i mem | awk '{ print $4 }'
+}
+
+
+#
+# Ensures that the PHP-FPM is running
+#
+function ensure_php_is_running {
+
+  if !  ps -lyC php-fpm > /dev/null; then
+    fail_by_exception "Cannot detect PHP-FPM. Is it running?"
+  fi
+}
+
+
+#
+# Ensures that we are running the current script as root
+#
+function ensure_run_as_root {
+
+  if  [[ ${EUID} -gt 0 ]]; then
+    fail_by_exception "${APP_NAME} must be executed as \"root\" (launched as \"$(whoami)}\"."
+  fi
+}
+
+
+#
+# Ensures that the required dependencies are available on the target system.
+#
+function ensure_dependencies_installed {
+
+  local i
+  local cmd
+  local dependencies=(
+    "awk"
+    "bc"
+    "cat"
+    "free"
+    "grep"
+    "ps"
+    "readarray"
+  )
+
+  for (( i = 0; i < ${#dependencies[@]}; i++))
+  do
+    cmd="${dependencies[$i]}"
+    command -v "${cmd}" >/dev/null 2>&1 || \
+            fail_by_exception "${APP_NAME} requires \"${cmd}\". Please install on your system before executing."
+  done
+}
+
+
+#
+# Terminates the script execution with the given message and exit code
+#
+#   message The error messsage to be printed
+#   code    The exit code
+#
+function fail_by_exception {
+
+  local message=${1}
+  local code=${2-1}
+
+  echo ""
+  echo "-- CRITICAL -------------------------------------------------------------------"
+  echo -e "${message}"
+  echo "-------------------------------------------------------------------------------"
+  echo ""
+  exit "${code}"
+}
+
+
+#
+# Returns the biggest number between "first" and "second".
+#
+#   first   The first number
+#   second  Imagine what? The second one.
+#
+function max {
+
+  local first=${1}
+  local second=${2}
+
+  if (( first > second )); then
+    echo "${first}"
+  else
+    echo "${second}"
+  fi
+}
+
+
+#
+# Returns the smallest number between "first" and "second".
+#
+#   first   The first number
+#   second  Imagine what? The second one.
+#
+function min {
+
+  local first=${1}
+  local second=${2}
+
+  if (( first < second )); then
+    echo "${first}"
+  else
+    echo "${second}"
+  fi
+}
+
+#
+# Calculates the PHP-FPM suggested paramaters
+#
+#   php_proc_mem_usage The PHP-FPM memory usage
+#   available_memory   The amount of memory that can be allocated to PHP-FPM
+#   has_autoscale      True if we have autoscaling.
+#
+function calculate_php_params {
+
+  local php_proc_mem_usage=${1}
+  local available_memory=${2}
+  local has_autoscale=${3}
+  local usable
+  local pm_max_children
+  local pm_start_servers
+  local pm_min_spare_servers
+  local pm_max_spare_servers
+  local AS_PE="0.9"
+  local AS_MIN_SPARE_PE="0.8"
+  local AS_MAX_SPARE_PE="0.9"
+  local NA_PE="0.8"
+
+  if [ "${has_autoscale}" == 'true' ]; then
+
+    usable=$(bc <<< "scale=0; ${available_memory} * ${AS_PE}")
+    pm_max_children=$(bc <<< "scale=0; ${usable}/${php_proc_mem_usage}/1")
+
+    pm="static"
+    pm_max_requests=0
+    pm_min_spare_servers=null
+    pm_max_spare_servers=null
+    pm_start_servers=null
+  else
+
+    usable=$(bc <<< "scale=0; ${available_memory} * ${NA_PE}/1")
+    pm_max_children=$(bc <<< "scale=0; ${usable}/${php_proc_mem_usage}/1")
+
+    pm="dynamic"
+    pm_max_requests=500
+    pm_min_spare_servers=$(bc <<< "scale=0; ${pm_max_children} * ${AS_MIN_SPARE_PE}/1")
+    pm_max_spare_servers=$(bc <<< "scale=0; ${pm_max_children} * ${AS_MAX_SPARE_PE}/1")
+    pm_start_servers="${pm_min_spare_servers}"
+  fi
+
+  build_php_fpm_config "${pm}" "${pm_max_children}" "${pm_min_spare_servers}" "${pm_max_spare_servers}" "${pm_start_servers}" "${pm_max_requests}"
+}
+
+
+#
+# Builds a PHP-FPM parameter.
+#
+#   name    The parameter name
+#   value   The parameter value
+#   default The default value
+#
+function build_parameter {
+
+  local name=${1}
+  local value=${2}
+  local default=${3}
+
+  if [ "${value}" == 'null' ]; then
+    echo ";${name} = ${default}"
+  else
+    echo "${name} = ${value}"
+  fi
+}
+
+
+#
+# Builds the PHP-FPM configuration
+#
+#   pm                   The value of the "pm" parameter.
+#   pm_max_children      The value of the "pm.max_children" parameter.
+#   pm_min_spare_servers The value of the "pm.min_spare_servers" parameter.
+#   pm_max_spare_servers The value of the "pm.max_spare_servers" parameter.
+#   m_start_servers      The value of the "pm.start_servers" parameter.
+#   pm_max_requests      The value of the "pm.max_requests" parameter.
+#
+function build_php_fpm_config {
+
+  local pm=${1}
+  local pm_max_children=${2}
+  local pm_min_spare_servers=${3}
+  local pm_max_spare_servers=${4}
+  local pm_start_servers=${5}
+  local pm_max_requests=${6}
+
+  echo '; Choose how the process manager will control the number of child processes.'
+  echo '; Possible Values:'
+  echo ';   static  - a fixed number (pm.max_children) of child processes;'
+  echo ';   dynamic - the number of child processes are set dynamically based on the'
+  echo ';             following directives. With this process management, there will be'
+  echo ';             always at least 1 children.'
+  echo ';             pm.max_children      - the maximum number of children that can'
+  echo ';                                    be alive at the same time.'
+  echo ';             pm.start_servers     - the number of children created on startup.'
+  echo ";             pm.min_spare_servers - the minimum number of children in 'idle'"
+  echo ';                                    state (waiting to process). If the number'
+  echo ";                                    of 'idle' processes is less than this"
+  echo ';                                    number then some children will be created.'
+  echo ";             pm.max_spare_servers - the maximum number of children in 'idle'"
+  echo ';                                    state (waiting to process). If the number'
+  echo ";                                    of 'idle' processes is greater than this"
+  echo ';                                    number then some children will be killed.'
+  echo ';  ondemand - no children are created at startup. Children will be forked when'
+  echo ';             new requests will connect. The following parameter are used:'
+  echo ';             pm.max_children           - the maximum number of children that'
+  echo ';                                         can be alive at the same time.'
+  echo ';             pm.process_idle_timeout   - The number of seconds after which'
+  echo ';                                         an idle process will be killed.'
+  echo '; Note: This value is mandatory.'
+  build_parameter "pm" "${pm}"
+
+  echo ''
+  echo "; The number of child processes to be created when pm is set to 'static' and the"
+  echo "; maximum number of child processes when pm is set to 'dynamic' or 'ondemand'."
+  echo '; This value sets the limit on the number of simultaneous requests that will be'
+  echo "; served. Equecho 'ivalent to the ApacheMaxClients directive with mpm_prefork."
+  echo '; Equivalent to the PHP_FCGI_CHILDREN environment variable in the original PHP'
+  echo "; CGI. The below defaults are based on a server without much resources. Don't"
+  echo '; forget to tweak pm.* to fit your needs.'
+  echo "; Note: Used when pm is set to 'static', 'dynamic' or 'ondemand'"
+  echo '; Note: This value is mandatory.'
+  build_parameter "pm.max_children" "${pm_max_children}" 50
+
+  echo ''
+  echo '; The number of child processes created on startup.'
+  echo "; Note: Used only when pm is set to 'dynamic'"
+  echo '; Default Value: min_spare_servers + (max_spare_servers - min_spare_servers) / 2'
+  build_parameter "pm.start_servers" "${pm_start_servers}" 5
+
+  echo ''
+  echo '; The desired minimum number of idle server processes.'
+  echo "; Note: Used only when pm is set to 'dynamic'"
+  echo "; Note: Mandatory when pm is set to 'dynamic'"
+  build_parameter "pm.min_spare_servers" "${pm_min_spare_servers}" 5
+
+  echo ''
+  echo '; The desired maximum number of idle server processes.'
+  echo "; Note: Used only when pm is set to 'dynamic'"
+  echo "; Note: Mandatory when pm is set to 'dynamic'"
+  build_parameter "pm.max_spare_servers" "${pm_max_spare_servers}" 35
+
+  echo ''
+  echo '; The number of seconds after which an idle process will be killed.'
+  echo "; Note: Used only when pm is set to 'ondemand'"
+  echo '; Default Value: 10s'
+  echo ';pm.process_idle_timeout = 10s;'
+  echo ''
+  echo '; The number of requests each child process should execute before respawning.'
+  echo '; This can be useful to work around memory leaks in 3rd party libraries. For'
+  echo "; endless request processing specify '0'. Equivalent to PHP_FCGI_MAX_REQUESTS."
+  echo '; Default Value: 0'
+  build_parameter "pm.max_requests" "${pm_max_requests}" 500
+  echo ''
+}
+
+
+#
+# Renders the main UI.
+#
+#   m1 Line 1
+#   m2 Line 2
+#   b1 Banner 1
+#   b2 Banner 1
+#   b3 Banner 1
+#
+function ui_render {
+
+  local m1=${1}
+  local m2=${2}
+  local b1=${3}
+  local b2=${4}
+  local b3=${5}
+
+  ui_header
+
+  echo "  ${m1}"
+  echo "  ${m2}"
+  echo '                                                                                '
+  echo '                                                                                '
+  echo "  ${b1}"
+  echo "  ${b2}"
+  echo "  ${b3}"
+  echo '                                                                                '
+  echo '                                                                                '
+  echo '                                                                                '
+}
+
+
+#
+# Renders the Header
+#
+function ui_header {
+
+  echo '                                                                                '
+  echo '  &&&                             &&&                       &'
+  echo '  &&&         &&&&      .&&& &&&  &&&     &&&&   /&&&&   &&&&&&#  #&&&&'
+  echo '  &&&      &&&   &&&% &&&&  &&&&  &&&  &&&           &&&   &&    *    &&&'
+  echo '  &&&      &&&    &&& &&&    &&&  &&&  &&&      &&&  &&&   &&    &&&  &&&'
+  echo '  &&&&&&&&  &&&&&&&&   &&&&&&&&&  &&&   &&&&&& /&&&&&&&&   &&&&#(&&&&&&&&'
+  echo '                            &&&'
+  echo '                       &&&&&&                    https://www.logicata.com'
+  echo '                                                                                '
+  echo '                                                                                '
+  echo "  ${APP_NAME} (${APP_VERSION})"
+  echo "  "
+}
+
+#
+# Renders the "Processing" view
+#
+#   duration  The data collection duration
+#
+function ui_show_processing {
+
+  local b1
+  local b2
+  local b3
+  local message_id=$((RANDOM % 3))
+
+  b1=$(get_logicata_text "${message_id}" 0)
+  b2=$(get_logicata_text "${message_id}" 1)
+  b3=$(get_logicata_text "${message_id}" 2)
+
+  ui_render "Collecting PHP-FPM metrics for ${duration}s. Please stress your PHP application!" "" "${b1}" "${b2}" "${b3}"
+}
+
+
+#
+# Renders the "Building Config" view
+#
+function ui_show_building_config {
+
+  ui_clean_prev_lines "${UI_VIEW_HEIGHT}"
+  ui_render "Building your PHP-FPM configuration. Please wait .."
+  sleep 1
+}
+
+
+#
+# Renders the "Complete" view
+#
+#   config_file The target PHP-FPM fragment configuration file
+#
+function ui_show_complete {
+
+  local config_file=${1}
+  local l1
+  local l2
+  local b1
+  local b2
+  local b3
+
+  ui_clean_prev_lines "${UI_VIEW_HEIGHT}"
+
+  l1="Done. Your PHP-FPM configuration is in:"
+  l2="${config_file}"
+
+  b1="Don't forget keeping up-to-date with our Podcast, Blog and News! Visit:"
+  b2=""
+  b3="                       ${HUB_URL}"
+
+  ui_render "${l1}" "${l2}" "${b1}" "${b2}" "${b3}"
+}
+
+
+#
+# Cleans the n-lines before the cursor
+#
+#   lines The amount of lines to clean
+#
+function ui_clean_prev_lines {
+
+  local lines=${1}
+  local i
+
+  for (( i = 0; i < lines; i++))
+  do
+    printf '\e[A\e[K'
+  done
+}
+
+
+#
+# Returns the Logicata waiting text
+#
+#   id   The message id   [0;2]
+#   line The message line [0;2]
+#
+function get_logicata_text {
+
+  local messages
+  local id=${1}
+  local line=${2}
+  declare -A messages
+
+  #             "     5    10    15    20    25    30    35    40    45    50    55    60    65"
+  #             "     |     |     |     |     |     |     |     |     |     |     |     |     | "
+  messages[0,0]="Optimising PHP-FPM is just the first step. Logicata can help you scale,"
+  messages[0,1]="and manage your entire Infrastructure."
+  messages[0,2]="                 Contact us at https://www.logicata.com"
+
+  messages[1,0]="Whether it is an Infrastructure or a Software problem, Logicata can help!"
+  messages[1,1]=""
+  messages[1,2]="                 Contact us at https://www.logicata.com"
+
+  messages[2,0]="This is just a tool. Discover what else Logicata can do for you!"
+  messages[2,1]=""
+  messages[2,2]="                 Visit https://www.logicata.com"
+
+  echo "${messages[${id},${line}]}"
+}
+
+
+#
+# Renders the progress bar
+#
+#   percentage The progress bar percentage
+#
+function ui_progress_at {
+
+  local progress=${1}
+  local screen_cols
+  local index
+  local bar_length
+
+  screen_cols=$(tput cols)
+  bar_length=$(((screen_cols -2) * progress/100))
+
+  printf '\e[A\e[K'
+  printf "["
+  for (( index = 0; index < screen_cols-2; index++))
+  do
+    if [[ index -lt bar_length ]]; then
+      printf '='
+    else
+      printf ' '
+    fi
+  done
+
+  printf "]\n"
+
+}
+
+
+#
+# Shows the command help
+#
+#   article_url      The Logicata article URL
+#   default_duration The default value for the --time parameter
+#
+function ui_show_help {
+
+  local article_url="$1"
+  local default_duration="$2"
+
+  ui_header
+  echo 'Calculates the optimised PHP-FPM parameters as discussed inside the'
+  echo 'Logicata blog article:'
+  echo ''
+  echo '  "AWS best practices for PHP"'
+  echo ''
+  echo 'Usage:'
+  echo "  ./${APP_BINARY_NAME} [-t|--time time] [-a|--autoscale]"
+  echo ''
+  echo 'Options:'
+  echo '  -t, --time         The approximate amount of seconds the script'
+  echo '                     should run to collect system usage metrics'
+  echo "                     (default ${default_duration}s)"
+  echo '  -a, --autoscale    Add this parameter if you have AWS autoscaling'
+  echo '                     configured (You should contact us if you'
+  echo '                     haven'\''t :)'
+  echo '  -h, --help         Shows this help.'
+  echo ''
+  echo 'Examples:'
+  echo ''
+  echo '  Collects data metrics for 3600 seconds (1 hour)'
+  echo "  ./${APP_BINARY_NAME} -t 3600"
+  echo ''
+  echo 'For more information, read our article at:'
+  echo ''
+  echo "  ${article_url}"
+  echo ''
+  echo 'If you need help, contact us. We''ll be happy to help your organisation.'
+  echo ''
+  echo '--'
+  echo 'The Logicata Team'
+  echo ''
+}
+
+
+# MAIN
+# ======================================================================================================================
+php_fpm_config_file=$(pwd)/${PHP_FPM_CONFIG_FILENAME}
+duration=${DEFAULT_DURATION}
+show_help=false
+overall_max_avg=0
+overall_max=0
+
+
+# Paring command-line
+while true; do
+  case "$1" in
+    -t | --time ) duration=${2}; shift 2;;
+    -h | --help ) show_help=true; shift ;;
+    -a | --autoscale ) has_autoscale=true; shift ;;
+    -- ) shift; break ;;
+    * ) break ;;
+  esac
+done
+
+if [ ${show_help} == 'true' ]; then
+  ui_show_help "${ARTICLE_URL}" "${DEFAULT_DURATION}" && exit
+fi
+
+# Checking pre-requirements
+ensure_dependencies_installed
+
+# Getting RAM information
+php_ram_usage=$(get_php_total_memory_usage)
+free_ram=$(get_free_memory)
+available_ram=$((free_ram + php_ram_usage))
+
+# Initialising the data-collection file
+echo "min,max,avg,processes,total" > "${DATA_FILE}"
+
+# Collecting data
+ui_show_processing "${duration}"
+
+last_index=$((duration * SAMPLING_RES))
+a_bit=$(bc <<< "scale=1; 1/${SAMPLING_RES}")
+for (( index = 0; index < last_index; index++))
+do
+
+  # shellcheck disable=SC2207
+  breakdown=($(get_php_memory_usage_breakdown))
+  min="${breakdown[0]}"
+  max=0
+  avg=avg
+  processes=$(count_php_processes)
+  total=0
+
+  for (( i = 0; i < ${#breakdown[@]}; i++))
+  do
+    partial="${breakdown[$i]}"
+    total=$((total + partial))
+    max=$(max "${max}" "${partial}")
+    min=$(min "${min}" "${partial}")
+  done
+
+  avg=$((total/processes))
+  overall_max=$(max "${overall_max}" "${max}")
+  overall_max_avg=$(max "${overall_max_avg}" "${avg}")
+  echo "${min},${max},${avg},${processes},${total}" >> "${DATA_FILE}"
+
+  progress=$((100 * index / last_index))
+  ui_progress_at "${progress}"
+
+  sleep "${a_bit}"
+done
+
+# Data collected. Building the configuration
+ui_show_building_config
+
+if [ "${has_autoscale}" == 'true' ]; then
+  calculate_php_params "${overall_max}" "${available_ram}" "${has_autoscale}" > "${php_fpm_config_file}"
+else
+  calculate_php_params "${overall_max_avg}" "${available_ram}" "${has_autoscale}" > "${php_fpm_config_file}"
+fi
+
+# Final greetings and cleaning
+ui_show_complete "${php_fpm_config_file}"
+
+
+# ======================================================================================================================
+#
+#                    If you have any questions or need help with your cloud solution, contact us!
+#
+#                                        Logicata - https://www.logicata.com
+#
+# ======================================================================================================================

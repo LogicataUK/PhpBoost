@@ -1,0 +1,3 @@
+# Generic exclusions
+.idea/
+.DS_Store
